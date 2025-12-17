@@ -1,0 +1,739 @@
+"""
+IEOR 240 Project: Comparing Optimization Methods for ML Training
+
+Methods:
+- Gradient Descent (full-batch)
+- Stochastic Gradient Descent (mini-batch)
+- Nesterov Accelerated Gradient (NAG)
+- Adam
+- SPSA (Simultaneous Perturbation Stochastic Approximation, gradient-free)
+
+Models:
+- Logistic Regression
+- Small 2-layer Neural Network
+
+Dataset:
+- Breast Cancer dataset from sklearn (binary classification, small & fast)
+
+
+"""
+
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+
+# ---------------------------
+# 1. Data loading utilities
+# ---------------------------
+
+def load_breast_cancer_torch(test_size=0.2, random_state=0, device="cpu"):
+    data = load_breast_cancer()
+    X = data.data
+    y = data.target  # 0/1
+
+    # Standardize features for stability
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+
+    # Convert to torch tensors
+    X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
+    y_train_t = torch.tensor(y_train, dtype=torch.long, device=device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
+    y_test_t = torch.tensor(y_test, dtype=torch.long, device=device)
+
+    return X_train_t, X_test_t, y_train_t, y_test_t
+
+
+# ---------------------------
+# 2. Model definitions
+# ---------------------------
+
+class LogisticModel(nn.Module):
+    """Logistic regression: linear layer + sigmoid (internally via BCEWithLogitsLoss)."""
+    def __init__(self, input_dim):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        # Return logits (no sigmoid here, handled by loss)
+        return self.linear(x).squeeze(-1)
+
+
+class SmallMLP(nn.Module):
+    """Small 2-layer neural network for binary classification."""
+    def __init__(self, input_dim, hidden_dim=32):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_dim, 1)  # binary logits
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x).squeeze(-1)
+        return x  # logits
+
+
+# ---------------------------
+# 3. Common training utilities
+# ---------------------------
+
+def binary_accuracy_from_logits(logits, y_true):
+    """
+    logits: tensor of shape (N,)
+    y_true: long tensor of {0,1} with shape (N,)
+    """
+    probs = torch.sigmoid(logits)
+    y_pred = (probs >= 0.5).long()
+    acc = (y_pred == y_true).float().mean().item()
+    return acc
+
+
+def train_one_epoch(model, optimizer, loss_fn, dataloader, device="cpu"):
+    model.train()
+    total_loss = 0.0
+    n_samples = 0
+
+    for xb, yb in dataloader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        optimizer.zero_grad()
+        logits = model(xb)
+        loss = loss_fn(logits, yb.float())  # BCEWithLogitsLoss expects float targets
+        loss.backward()
+        optimizer.step()
+
+        batch_size = xb.size(0)
+        total_loss += loss.item() * batch_size
+        n_samples += batch_size
+
+    return total_loss / n_samples
+
+
+def evaluate_model(model, loss_fn, X, y, device="cpu"):
+    model.eval()
+    with torch.no_grad():
+        logits = model(X.to(device))
+        loss = loss_fn(logits, y.to(device).float()).item()
+        acc = binary_accuracy_from_logits(logits, y.to(device))
+    return loss, acc
+
+
+# ---------------------------
+# 4. SPSA for Logistic Regression
+# ---------------------------
+
+def spsa_logistic_train(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    max_iters=200,
+    a=0.1,
+    c=0.1,
+    alpha=0.602,
+    gamma=0.101,
+    A=10.0,
+    device="cpu"
+):
+    """
+    SPSA training for logistic regression:
+        theta includes weights and bias as a single vector.
+    Uses full-batch loss for simplicity (n is small).
+
+    Returns:
+        theta  : final parameter vector (weights + bias)
+        history: dict with loss & accuracy over iterations.
+    """
+    X_train = X_train.to(device)
+    y_train = y_train.to(device)
+    X_val = X_val.to(device)
+    y_val = y_val.to(device)
+
+    n, d = X_train.shape
+    # Initialize parameters near zero
+    theta = torch.zeros(d + 1, dtype=torch.float32, device=device)
+
+    def loss_fn(theta, X, y):
+        w = theta[:-1]
+        b = theta[-1]
+        logits = X @ w + b
+        probs = torch.sigmoid(logits)
+        eps = 1e-8
+        loss = - (y * torch.log(probs + eps) +
+                  (1 - y) * torch.log(1 - probs + eps)).mean()
+        return loss
+
+    def acc_fn(theta, X, y):
+        w = theta[:-1]
+        b = theta[-1]
+        logits = X @ w + b
+        probs = torch.sigmoid(logits)
+        y_pred = (probs >= 0.5).long()
+        return (y_pred == y).float().mean().item()
+
+    history = {"iter": [], "train_loss": [], "val_loss": [], "val_acc": []}
+
+    for k in range(max_iters):
+        ak = a / ((k + 1 + A) ** alpha)
+        ck = c / ((k + 1) ** gamma)
+
+        # Rademacher perturbation: +/- 1
+        delta = torch.randint(low=0, high=2, size=theta.shape, device=device) * 2 - 1
+        theta_plus = theta + ck * delta
+        theta_minus = theta - ck * delta
+
+        # Evaluate loss at perturbed points
+        J_plus = loss_fn(theta_plus, X_train, y_train)
+        J_minus = loss_fn(theta_minus, X_train, y_train)
+
+        # Estimate gradient
+        g_hat = (J_plus - J_minus) / (2.0 * ck) * delta  # element-wise
+
+        # Update
+        theta = theta - ak * g_hat
+
+        # Logging
+        if (k + 1) % 10 == 0 or k == 0:
+            train_loss = loss_fn(theta, X_train, y_train).item()
+            val_loss = loss_fn(theta, X_val, y_val).item()
+            val_acc = acc_fn(theta, X_val, y_val)
+
+            history["iter"].append(k + 1)
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+
+            print(
+                f"[SPSA] Iter {k+1:4d} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+
+    return theta, history
+
+
+# ---------------------------
+# 4b. SPSA for MLP
+# ---------------------------
+
+def spsa_mlp_train(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    input_dim,
+    hidden_dim=32,
+    max_iters=200,
+    a=0.05,
+    c=0.05,
+    alpha=0.602,
+    gamma=0.101,
+    A=10.0,
+    device="cpu"
+):
+    """
+    SPSA training for the SmallMLP model.
+    We flatten all parameters into a single vector theta, perturb it,
+    compute loss via forward passes, and update theta via SPSA.
+    """
+    X_train = X_train.to(device)
+    y_train = y_train.to(device)
+    X_val = X_val.to(device)
+    y_val = y_val.to(device)
+
+    model = SmallMLP(input_dim, hidden_dim=hidden_dim).to(device)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    # --- helpers to flatten / unflatten parameters ---
+
+    params = list(model.parameters())
+    shapes = [p.shape for p in params]
+    sizes = [p.numel() for p in params]
+    cum_sizes = np.cumsum([0] + sizes)
+
+    def flatten_params():
+        return torch.cat([p.detach().view(-1) for p in params])
+
+    def set_params(theta_vec):
+        with torch.no_grad():
+            for i, p in enumerate(params):
+                start = cum_sizes[i]
+                end = cum_sizes[i + 1]
+                p.copy_(theta_vec[start:end].view(shapes[i]))
+
+    theta = flatten_params().to(device)
+
+    def loss_for_theta(theta_vec, X, y):
+        set_params(theta_vec)
+        with torch.no_grad():
+            logits = model(X)
+            loss = loss_fn(logits, y.float())
+        return loss
+
+    def acc_for_theta(theta_vec, X, y):
+        set_params(theta_vec)
+        with torch.no_grad():
+            logits = model(X)
+            probs = torch.sigmoid(logits)
+            y_pred = (probs >= 0.5).long()
+            acc = (y_pred == y).float().mean().item()
+        return acc
+
+    history = {"iter": [], "train_loss": [], "val_loss": [], "val_acc": []}
+
+    for k in range(max_iters):
+        ak = a / ((k + 1 + A) ** alpha)
+        ck = c / ((k + 1) ** gamma)
+
+        delta = torch.randint(low=0, high=2, size=theta.shape, device=device) * 2 - 1
+        theta_plus = theta + ck * delta
+        theta_minus = theta - ck * delta
+
+        J_plus = loss_for_theta(theta_plus, X_train, y_train)
+        J_minus = loss_for_theta(theta_minus, X_train, y_train)
+
+        g_hat = (J_plus - J_minus) / (2.0 * ck) * delta
+        theta = theta - ak * g_hat
+
+        if (k + 1) % 10 == 0 or k == 0:
+            train_loss = loss_for_theta(theta, X_train, y_train).item()
+            val_loss = loss_for_theta(theta, X_val, y_val).item()
+            val_acc = acc_for_theta(theta, X_val, y_val)
+            history["iter"].append(k + 1)
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+            print(
+                f"[MLP SPSA] Iter {k+1:4d} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+
+    # set final params into model before returning
+    set_params(theta)
+    return model, history
+
+
+# ---------------------------
+# 5. Experiment runners
+# ---------------------------
+
+def run_logistic_experiments(device="cpu"):
+    print("=== Logistic Regression Experiments ===")
+    X_train, X_test, y_train, y_test = load_breast_cancer_torch(device=device)
+
+    # Train/val split on training set (e.g. 80/20)
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train.cpu().numpy(),
+        y_train.cpu().numpy(),
+        test_size=0.2,
+        random_state=0,
+        stratify=y_train.cpu().numpy()
+    )
+    X_tr = torch.tensor(X_tr, dtype=torch.float32, device=device)
+    X_val = torch.tensor(X_val, dtype=torch.float32, device=device)
+    y_tr = torch.tensor(y_tr, dtype=torch.long, device=device)
+    y_val = torch.tensor(y_val, dtype=torch.long, device=device)
+
+    input_dim = X_tr.shape[1]
+    batch_size_sgd = 32
+    n_epochs = 50
+
+    # Loss function
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    # DataLoaders
+    full_train_ds = TensorDataset(X_tr, y_tr)
+    full_train_loader = DataLoader(full_train_ds, batch_size=len(full_train_ds), shuffle=True)
+    sgd_train_loader = DataLoader(full_train_ds, batch_size=batch_size_sgd, shuffle=True)
+
+    # Store results
+    results = {}
+
+    # ---- Gradient Descent (full batch) ----
+    model_gd = LogisticModel(input_dim).to(device)
+    optimizer_gd = torch.optim.SGD(model_gd.parameters(), lr=0.1)
+    print("\n[Logistic] Training with Gradient Descent (full batch)...")
+    start = time.time()
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model_gd, optimizer_gd, loss_fn, full_train_loader, device)
+        val_loss, val_acc = evaluate_model(model_gd, loss_fn, X_val, y_val, device)
+        if epoch % 10 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+    elapsed_gd = time.time() - start
+    test_loss, test_acc = evaluate_model(model_gd, loss_fn, X_test, y_test, device)
+    results["GD"] = (test_loss, test_acc, elapsed_gd)
+
+    # ---- SGD (mini-batch) ----
+    model_sgd = LogisticModel(input_dim).to(device)
+    optimizer_sgd = torch.optim.SGD(model_sgd.parameters(), lr=0.05)
+    print("\n[Logistic] Training with SGD (mini-batch)...")
+    start = time.time()
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model_sgd, optimizer_sgd, loss_fn, sgd_train_loader, device)
+        val_loss, val_acc = evaluate_model(model_sgd, loss_fn, X_val, y_val, device)
+        if epoch % 10 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+    elapsed_sgd = time.time() - start
+    test_loss, test_acc = evaluate_model(model_sgd, loss_fn, X_test, y_test, device)
+    results["SGD"] = (test_loss, test_acc, elapsed_sgd)
+
+    # ---- Nesterov Accelerated Gradient (NAG) ----
+    model_nag = LogisticModel(input_dim).to(device)
+    optimizer_nag = torch.optim.SGD(model_nag.parameters(), lr=0.05, momentum=0.9, nesterov=True)
+    print("\n[Logistic] Training with Nesterov Accelerated Gradient...")
+    start = time.time()
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model_nag, optimizer_nag, loss_fn, sgd_train_loader, device)
+        val_loss, val_acc = evaluate_model(model_nag, loss_fn, X_val, y_val, device)
+        if epoch % 10 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+    elapsed_nag = time.time() - start
+    test_loss, test_acc = evaluate_model(model_nag, loss_fn, X_test, y_test, device)
+    results["NAG"] = (test_loss, test_acc, elapsed_nag)
+
+    # ---- Adam ----
+    model_adam = LogisticModel(input_dim).to(device)
+    optimizer_adam = torch.optim.Adam(model_adam.parameters(), lr=0.01)
+    print("\n[Logistic] Training with Adam...")
+    start = time.time()
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model_adam, optimizer_adam, loss_fn, sgd_train_loader, device)
+        val_loss, val_acc = evaluate_model(model_adam, loss_fn, X_val, y_val, device)
+        if epoch % 10 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+    elapsed_adam = time.time() - start
+    test_loss, test_acc = evaluate_model(model_adam, loss_fn, X_test, y_test, device)
+    results["Adam"] = (test_loss, test_acc, elapsed_adam)
+
+    # ---- SPSA ----
+    print("\n[Logistic] Training with SPSA (gradient-free)...")
+    start = time.time()
+    theta_spsa, spsa_hist = spsa_logistic_train(
+        X_tr, y_tr, X_val, y_val,
+        max_iters=200,
+        a=0.1,
+        c=0.1,
+        alpha=0.602,
+        gamma=0.101,
+        A=10.0,
+        device=device
+    )
+    elapsed_spsa = time.time() - start
+
+    def spsa_loss_acc(theta, X, y):
+        X = X.to(device)
+        y = y.to(device)
+        w = theta[:-1]
+        b = theta[-1]
+        logits = X @ w + b
+        probs = torch.sigmoid(logits)
+        eps = 1e-8
+        loss = - (y * torch.log(probs + eps) +
+                  (1 - y) * torch.log(1 - probs + eps)).mean().item()
+        y_pred = (probs >= 0.5).long()
+        acc = (y_pred == y).float().mean().item()
+        return loss, acc
+
+    test_loss_spsa, test_acc_spsa = spsa_loss_acc(theta_spsa, X_test, y_test)
+    results["SPSA"] = (test_loss_spsa, test_acc_spsa, elapsed_spsa)
+    print(f"\n[SPSA] Finished in {elapsed_spsa:.3f} seconds.")
+
+    # Print summary table
+    print("\n=== Logistic Regression Summary (Test Set) ===")
+    print(f"{'Method':8s} | {'Test Loss':>10s} | {'Test Acc':>9s} | {'Time (s)':>8s}")
+    print("-" * 45)
+    for method, (loss, acc, t) in results.items():
+        print(f"{method:8s} | {loss:10.4f} | {acc:9.4f} | {t:8.3f}")
+
+
+def run_mlp_experiments(device="cpu"):
+    print("\n\n=== Small Neural Network Experiments ===")
+    X_train, X_test, y_train, y_test = load_breast_cancer_torch(device=device)
+
+    # Train/val split on training set
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train.cpu().numpy(),
+        y_train.cpu().numpy(),
+        test_size=0.2,
+        random_state=0,
+        stratify=y_train.cpu().numpy()
+    )
+    X_tr = torch.tensor(X_tr, dtype=torch.float32, device=device)
+    X_val = torch.tensor(X_val, dtype=torch.float32, device=device)
+    y_tr = torch.tensor(y_tr, dtype=torch.long, device=device)
+    y_val = torch.tensor(y_val, dtype=torch.long, device=device)
+
+    input_dim = X_tr.shape[1]
+    batch_size = 32
+    n_epochs = 20  # smaller, NN is more expensive than logistic
+
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    train_ds = TensorDataset(X_tr, y_tr)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+    results = {}
+
+    # ---- GD (full batch) ----
+    model_gd = SmallMLP(input_dim, hidden_dim=32).to(device)
+    optimizer_gd = torch.optim.SGD(model_gd.parameters(), lr=0.1)
+    full_train_loader = DataLoader(train_ds, batch_size=len(train_ds), shuffle=True)
+
+    print("\n[MLP] Training with Gradient Descent (full batch)...")
+    start = time.time()
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model_gd, optimizer_gd, loss_fn, full_train_loader, device)
+        val_loss, val_acc = evaluate_model(model_gd, loss_fn, X_val, y_val, device)
+        if epoch % 5 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+    elapsed_gd = time.time() - start
+    test_loss, test_acc = evaluate_model(model_gd, loss_fn, X_test, y_test, device)
+    results["GD"] = (test_loss, test_acc, elapsed_gd)
+
+    # ---- SGD ----
+    model_sgd = SmallMLP(input_dim, hidden_dim=32).to(device)
+    optimizer_sgd = torch.optim.SGD(model_sgd.parameters(), lr=0.05)
+    print("\n[MLP] Training with SGD (mini-batch)...")
+    start = time.time()
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model_sgd, optimizer_sgd, loss_fn, train_loader, device)
+        val_loss, val_acc = evaluate_model(model_sgd, loss_fn, X_val, y_val, device)
+        if epoch % 5 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+    elapsed_sgd = time.time() - start
+    test_loss, test_acc = evaluate_model(model_sgd, loss_fn, X_test, y_test, device)
+    results["SGD"] = (test_loss, test_acc, elapsed_sgd)
+
+    # ---- NAG ----
+    model_nag = SmallMLP(input_dim, hidden_dim=32).to(device)
+    optimizer_nag = torch.optim.SGD(model_nag.parameters(), lr=0.05, momentum=0.9, nesterov=True)
+    print("\n[MLP] Training with Nesterov Accelerated Gradient...")
+    start = time.time()
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model_nag, optimizer_nag, loss_fn, train_loader, device)
+        val_loss, val_acc = evaluate_model(model_nag, loss_fn, X_val, y_val, device)
+        if epoch % 5 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+    elapsed_nag = time.time() - start
+    test_loss, test_acc = evaluate_model(model_nag, loss_fn, X_test, y_test, device)
+    results["NAG"] = (test_loss, test_acc, elapsed_nag)
+
+    # ---- Adam ----
+    model_adam = SmallMLP(input_dim, hidden_dim=32).to(device)
+    optimizer_adam = torch.optim.Adam(model_adam.parameters(), lr=0.01)
+    print("\n[MLP] Training with Adam...")
+    start = time.time()
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model_adam, optimizer_adam, loss_fn, train_loader, device)
+        val_loss, val_acc = evaluate_model(model_adam, loss_fn, X_val, y_val, device)
+        if epoch % 5 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
+    elapsed_adam = time.time() - start
+    test_loss, test_acc = evaluate_model(model_adam, loss_fn, X_test, y_test, device)
+    results["Adam"] = (test_loss, test_acc, elapsed_adam)
+
+    # ---- SPSA for MLP ----
+    print("\n[MLP] Training with SPSA (gradient-free)...")
+    start = time.time()
+    model_spsa, spsa_hist_mlp = spsa_mlp_train(
+        X_tr, y_tr, X_val, y_val,
+        input_dim=input_dim,
+        hidden_dim=32,
+        max_iters=200,
+        a=0.05,
+        c=0.05,
+        alpha=0.602,
+        gamma=0.101,
+        A=10.0,
+        device=device
+    )
+    elapsed_spsa_mlp = time.time() - start
+    test_loss_spsa, test_acc_spsa = evaluate_model(model_spsa, loss_fn, X_test, y_test, device)
+    results["SPSA"] = (test_loss_spsa, test_acc_spsa, elapsed_spsa_mlp)
+
+    # Summary table
+    print("\n=== MLP Summary (Test Set) ===")
+    print(f"{'Method':8s} | {'Test Loss':>10s} | {'Test Acc':>9s} | {'Time (s)':>8s}")
+    print("-" * 45)
+    for method, (loss, acc, t) in results.items():
+        print(f"{method:8s} | {loss:10.4f} | {acc:9.4f} | {t:8.3f}")
+
+
+# ---------------------------
+# 6. Main
+# ---------------------------
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    run_logistic_experiments(device=device)
+    run_mlp_experiments(device=device)
+Using device: cuda
+=== Logistic Regression Experiments ===
+
+[Logistic] Training with Gradient Descent (full batch)...
+Epoch   1 | Train Loss: 0.7955 | Val Loss: 0.5887 | Val Acc: 0.7912
+Epoch  10 | Train Loss: 0.2577 | Val Loss: 0.2587 | Val Acc: 0.9231
+Epoch  20 | Train Loss: 0.1918 | Val Loss: 0.1928 | Val Acc: 0.9451
+Epoch  30 | Train Loss: 0.1627 | Val Loss: 0.1615 | Val Acc: 0.9560
+Epoch  40 | Train Loss: 0.1455 | Val Loss: 0.1422 | Val Acc: 0.9560
+Epoch  50 | Train Loss: 0.1340 | Val Loss: 0.1288 | Val Acc: 0.9780
+
+[Logistic] Training with SGD (mini-batch)...
+Epoch   1 | Train Loss: 0.4473 | Val Loss: 0.3260 | Val Acc: 0.9451
+Epoch  10 | Train Loss: 0.1284 | Val Loss: 0.1196 | Val Acc: 0.9780
+Epoch  20 | Train Loss: 0.1014 | Val Loss: 0.0902 | Val Acc: 0.9670
+Epoch  30 | Train Loss: 0.0903 | Val Loss: 0.0766 | Val Acc: 0.9670
+Epoch  40 | Train Loss: 0.0837 | Val Loss: 0.0690 | Val Acc: 0.9890
+Epoch  50 | Train Loss: 0.0791 | Val Loss: 0.0633 | Val Acc: 0.9890
+
+[Logistic] Training with Nesterov Accelerated Gradient...
+Epoch   1 | Train Loss: 0.3149 | Val Loss: 0.1219 | Val Acc: 0.9560
+Epoch  10 | Train Loss: 0.0657 | Val Loss: 0.0461 | Val Acc: 0.9890
+Epoch  20 | Train Loss: 0.0594 | Val Loss: 0.0378 | Val Acc: 0.9890
+Epoch  30 | Train Loss: 0.0560 | Val Loss: 0.0357 | Val Acc: 0.9890
+Epoch  40 | Train Loss: 0.0544 | Val Loss: 0.0331 | Val Acc: 0.9890
+Epoch  50 | Train Loss: 0.0530 | Val Loss: 0.0320 | Val Acc: 0.9890
+
+[Logistic] Training with Adam...
+Epoch   1 | Train Loss: 0.3913 | Val Loss: 0.2593 | Val Acc: 0.9451
+Epoch  10 | Train Loss: 0.0923 | Val Loss: 0.0676 | Val Acc: 0.9890
+Epoch  20 | Train Loss: 0.0730 | Val Loss: 0.0476 | Val Acc: 0.9890
+Epoch  30 | Train Loss: 0.0651 | Val Loss: 0.0403 | Val Acc: 0.9890
+Epoch  40 | Train Loss: 0.0604 | Val Loss: 0.0355 | Val Acc: 0.9890
+Epoch  50 | Train Loss: 0.0579 | Val Loss: 0.0340 | Val Acc: 0.9890
+
+[Logistic] Training with SPSA (gradient-free)...
+[SPSA] Iter    1 | Train Loss: 0.5372 | Val Loss: 0.5706 | Val Acc: 0.7582
+[SPSA] Iter   10 | Train Loss: 0.3979 | Val Loss: 0.4324 | Val Acc: 0.8681
+[SPSA] Iter   20 | Train Loss: 0.3214 | Val Loss: 0.3466 | Val Acc: 0.9121
+[SPSA] Iter   30 | Train Loss: 0.2802 | Val Loss: 0.3059 | Val Acc: 0.9011
+[SPSA] Iter   40 | Train Loss: 0.2549 | Val Loss: 0.2759 | Val Acc: 0.9121
+[SPSA] Iter   50 | Train Loss: 0.2480 | Val Loss: 0.2690 | Val Acc: 0.9121
+[SPSA] Iter   60 | Train Loss: 0.2404 | Val Loss: 0.2611 | Val Acc: 0.9121
+[SPSA] Iter   70 | Train Loss: 0.2303 | Val Loss: 0.2483 | Val Acc: 0.9121
+[SPSA] Iter   80 | Train Loss: 0.2248 | Val Loss: 0.2422 | Val Acc: 0.9121
+[SPSA] Iter   90 | Train Loss: 0.2241 | Val Loss: 0.2416 | Val Acc: 0.9231
+[SPSA] Iter  100 | Train Loss: 0.2187 | Val Loss: 0.2360 | Val Acc: 0.9231
+[SPSA] Iter  110 | Train Loss: 0.2165 | Val Loss: 0.2333 | Val Acc: 0.9231
+[SPSA] Iter  120 | Train Loss: 0.2114 | Val Loss: 0.2271 | Val Acc: 0.9231
+[SPSA] Iter  130 | Train Loss: 0.2078 | Val Loss: 0.2225 | Val Acc: 0.9231
+[SPSA] Iter  140 | Train Loss: 0.2056 | Val Loss: 0.2195 | Val Acc: 0.9231
+[SPSA] Iter  150 | Train Loss: 0.2022 | Val Loss: 0.2154 | Val Acc: 0.9341
+[SPSA] Iter  160 | Train Loss: 0.1998 | Val Loss: 0.2129 | Val Acc: 0.9341
+[SPSA] Iter  170 | Train Loss: 0.1976 | Val Loss: 0.2102 | Val Acc: 0.9341
+[SPSA] Iter  180 | Train Loss: 0.1949 | Val Loss: 0.2076 | Val Acc: 0.9341
+[SPSA] Iter  190 | Train Loss: 0.1925 | Val Loss: 0.2048 | Val Acc: 0.9451
+[SPSA] Iter  200 | Train Loss: 0.1902 | Val Loss: 0.2018 | Val Acc: 0.9451
+
+[SPSA] Finished in 0.153 seconds.
+
+=== Logistic Regression Summary (Test Set) ===
+Method   |  Test Loss |  Test Acc | Time (s)
+---------------------------------------------
+GD       |     0.1794 |    0.9211 |    0.234
+SGD      |     0.1007 |    0.9737 |    0.791
+NAG      |     0.0854 |    0.9737 |    0.727
+Adam     |     0.0897 |    0.9649 |    0.853
+SPSA     |     0.2391 |    0.9211 |    0.153
+
+
+=== Small Neural Network Experiments ===
+
+[MLP] Training with Gradient Descent (full batch)...
+Epoch   1 | Train Loss: 0.7245 | Val Loss: 0.6691 | Val Acc: 0.6703
+Epoch   5 | Train Loss: 0.5828 | Val Loss: 0.5507 | Val Acc: 0.9011
+Epoch  10 | Train Loss: 0.4576 | Val Loss: 0.4384 | Val Acc: 0.9560
+Epoch  15 | Train Loss: 0.3629 | Val Loss: 0.3516 | Val Acc: 0.9670
+Epoch  20 | Train Loss: 0.2952 | Val Loss: 0.2885 | Val Acc: 0.9670
+
+[MLP] Training with SGD (mini-batch)...
+Epoch   1 | Train Loss: 0.6290 | Val Loss: 0.5446 | Val Acc: 0.9011
+Epoch   5 | Train Loss: 0.2351 | Val Loss: 0.2244 | Val Acc: 0.9560
+Epoch  10 | Train Loss: 0.1375 | Val Loss: 0.1288 | Val Acc: 0.9670
+Epoch  15 | Train Loss: 0.1036 | Val Loss: 0.0935 | Val Acc: 0.9670
+Epoch  20 | Train Loss: 0.0859 | Val Loss: 0.0745 | Val Acc: 0.9890
+
+[MLP] Training with Nesterov Accelerated Gradient...
+Epoch   1 | Train Loss: 0.4031 | Val Loss: 0.1521 | Val Acc: 0.9670
+Epoch   5 | Train Loss: 0.0571 | Val Loss: 0.0416 | Val Acc: 0.9780
+Epoch  10 | Train Loss: 0.0416 | Val Loss: 0.0327 | Val Acc: 1.0000
+Epoch  15 | Train Loss: 0.0304 | Val Loss: 0.0249 | Val Acc: 1.0000
+Epoch  20 | Train Loss: 0.0237 | Val Loss: 0.0228 | Val Acc: 1.0000
+
+[MLP] Training with Adam...
+Epoch   1 | Train Loss: 0.3656 | Val Loss: 0.1391 | Val Acc: 0.9560
+Epoch   5 | Train Loss: 0.0560 | Val Loss: 0.0306 | Val Acc: 0.9890
+Epoch  10 | Train Loss: 0.0331 | Val Loss: 0.0166 | Val Acc: 1.0000
+Epoch  15 | Train Loss: 0.0171 | Val Loss: 0.0108 | Val Acc: 1.0000
+Epoch  20 | Train Loss: 0.0096 | Val Loss: 0.0092 | Val Acc: 1.0000
+
+[MLP] Training with SPSA (gradient-free)...
+[MLP SPSA] Iter    1 | Train Loss: 0.6835 | Val Loss: 0.6677 | Val Acc: 0.6154
+[MLP SPSA] Iter   10 | Train Loss: 0.6585 | Val Loss: 0.6453 | Val Acc: 0.6813
+[MLP SPSA] Iter   20 | Train Loss: 0.6293 | Val Loss: 0.6212 | Val Acc: 0.8022
+[MLP SPSA] Iter   30 | Train Loss: 0.6046 | Val Loss: 0.6002 | Val Acc: 0.8022
+[MLP SPSA] Iter   40 | Train Loss: 0.5994 | Val Loss: 0.5946 | Val Acc: 0.7912
+[MLP SPSA] Iter   50 | Train Loss: 0.5863 | Val Loss: 0.5834 | Val Acc: 0.8242
+[MLP SPSA] Iter   60 | Train Loss: 0.5743 | Val Loss: 0.5720 | Val Acc: 0.8462
+[MLP SPSA] Iter   70 | Train Loss: 0.5560 | Val Loss: 0.5564 | Val Acc: 0.8791
+[MLP SPSA] Iter   80 | Train Loss: 0.5493 | Val Loss: 0.5506 | Val Acc: 0.9011
+[MLP SPSA] Iter   90 | Train Loss: 0.5412 | Val Loss: 0.5415 | Val Acc: 0.9011
+[MLP SPSA] Iter  100 | Train Loss: 0.5298 | Val Loss: 0.5310 | Val Acc: 0.9121
+[MLP SPSA] Iter  110 | Train Loss: 0.5263 | Val Loss: 0.5274 | Val Acc: 0.9121
+[MLP SPSA] Iter  120 | Train Loss: 0.5187 | Val Loss: 0.5211 | Val Acc: 0.9121
+[MLP SPSA] Iter  130 | Train Loss: 0.5137 | Val Loss: 0.5164 | Val Acc: 0.9231
+[MLP SPSA] Iter  140 | Train Loss: 0.5017 | Val Loss: 0.5050 | Val Acc: 0.9231
+[MLP SPSA] Iter  150 | Train Loss: 0.4924 | Val Loss: 0.4963 | Val Acc: 0.9231
+[MLP SPSA] Iter  160 | Train Loss: 0.4813 | Val Loss: 0.4866 | Val Acc: 0.9231
+[MLP SPSA] Iter  170 | Train Loss: 0.4696 | Val Loss: 0.4747 | Val Acc: 0.9341
+[MLP SPSA] Iter  180 | Train Loss: 0.4654 | Val Loss: 0.4708 | Val Acc: 0.9341
+[MLP SPSA] Iter  190 | Train Loss: 0.4600 | Val Loss: 0.4657 | Val Acc: 0.9341
+[MLP SPSA] Iter  200 | Train Loss: 0.4561 | Val Loss: 0.4621 | Val Acc: 0.9341
+
+=== MLP Summary (Test Set) ===
+Method   |  Test Loss |  Test Acc | Time (s)
+---------------------------------------------
+GD       |     0.3050 |    0.9298 |    0.081
+SGD      |     0.1197 |    0.9649 |    0.393
+NAG      |     0.1106 |    0.9561 |    0.406
+Adam     |     0.1358 |    0.9474 |    0.335
+SPSA     |     0.4755 |    0.9123 |    0.221
